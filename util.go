@@ -30,24 +30,24 @@ func TrimAPIPrefix(name string) string {
 
 // BlankLineStrippingWriter removes whitespace- or comment-only lines delimited
 // by \n. A necessary evil to work around how text/template handles whitespace.
-// The template needs a new line at the end.
+// Flush writes a final line without a newline after the template completes.
 //
 // Comment-based annotations are accepted to define sections of code that
 // should have their blank lines kept intact, like so:
 //
-//  //
-//  //glow:keepspace
-//  //
-//  // Hello World!
-//  //
-//  //glow:rmspace
-//  //
+//	//
+//	//glow:keepspace
+//	//
+//	// Hello World!
+//	//
+//	//glow:rmspace
+//	//
 //
 // The writer would produce output like:
-//  //
-//  // Hello World!
-//  //
 //
+//	//
+//	// Hello World!
+//	//
 type BlankLineStrippingWriter struct {
 	output    io.Writer
 	buf       *bytes.Buffer
@@ -61,6 +61,15 @@ func NewBlankLineStrippingWriter(wrapped io.Writer) *BlankLineStrippingWriter {
 		buf:       new(bytes.Buffer),
 		stripping: true,
 	}
+}
+
+// Flush preserves a final, incomplete line instead of silently dropping it.
+func (w *BlankLineStrippingWriter) Flush() error {
+	if w.buf.Len() == 0 {
+		return nil
+	}
+	_, err := w.Write([]byte("\n"))
+	return err
 }
 
 func isBlank(line string) bool {

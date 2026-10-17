@@ -29,6 +29,7 @@ func Ptr(data interface{}) unsafe.Pointer {
 	v := reflect.ValueOf(data)
 	switch v.Type().Kind() {
 	case reflect.Ptr:
+		if v.IsNil() { return nil }
 		e := v.Elem()
 		switch e.Kind() {
 		case
@@ -42,6 +43,7 @@ func Ptr(data interface{}) unsafe.Pointer {
 	case reflect.Uintptr:
 		addr = unsafe.Pointer(data.(uintptr))
 	case reflect.Slice:
+		if v.Len() == 0 { return nil }
 		addr = unsafe.Pointer(v.Index(0).UnsafeAddr())
 	default:
 		panic(fmt.Errorf("unsupported type %s; must be a slice or pointer to a singular scalar value or the first element of an array or slice", v.Type()))
@@ -71,8 +73,7 @@ func Str(str string) *uint8 {
 	if !strings.HasSuffix(str, "\x00") {
 		panic("str argument missing null terminator: " + str)
 	}
-	header := (*reflect.StringHeader)(unsafe.Pointer(&str))
-	return (*uint8)(unsafe.Pointer(header.Data))
+	return unsafe.StringData(str)
 }
 
 // GoStr takes a null-terminated string returned by OpenGL and constructs a
@@ -81,37 +82,68 @@ func GoStr(cstr *uint8) string {
 	return C.GoString((*C.char)(unsafe.Pointer(cstr)))
 }
 
-// Strs takes a list of Go strings (with or without null-termination) and
-// returns their C counterpart.
-//
-// The returned free function must be called once you are done using the strings
-// in order to free the memory.
-//
-// If no strings are provided as a parameter this function will panic.
+// Scalar is a fixed-width numeric type accepted by GL uploads.
+type Scalar interface {
+    ~int8 | ~uint8 | ~int16 | ~uint16 | ~int32 | ~uint32 | ~int64 | ~uint64 | ~float32 | ~float64
+}
+
+// SlicePtr returns a numeric slice's address without reflection or boxing.
+// Empty slices return nil. Keep data alive until the native call completes;
+// native code must not retain this Go pointer.
+func SlicePtr[T Scalar](data []T) unsafe.Pointer {
+    if len(data) == 0 { return nil }
+    return unsafe.Pointer(unsafe.SliceData(data))
+}
+
+// SliceBytes returns the byte length for a numeric slice.
+func SliceBytes[T Scalar](data []T) int {
+    var value T
+    size := int(unsafe.Sizeof(value))
+    if len(data) > int(^uint(0)>>1)/size { panic("SliceBytes: size overflow") }
+    return len(data)*size
+}
+
+// Strs copies strings into C-owned storage, adding a NUL terminator when absent.
+// Existing terminators and embedded NUL bytes are preserved. The returned free
+// function must be called exactly once, after the last native use.
+// With an embedded NUL, use StrsWithLengths and pass its lengths to ShaderSource.
+// Strs panics if no strings are supplied or the total size overflows int.
 func Strs(strs ...string) (cstrs **uint8, free func()) {
-	if len(strs) == 0 {
-		panic("Strs: expected at least 1 string")
-	}
+    if len(strs) == 0 { panic("Strs: expected at least 1 string") }
+    max := int(^uint(0)>>1)
+    width := int(unsafe.Sizeof(uintptr(0)))
+    if len(strs) > max/width { panic("Strs: size overflow") }
+    n := len(strs)*width
+    for _, str := range strs {
+        extra := 0
+        if !strings.HasSuffix(str, "\x00") { extra = 1 }
+        if len(str) > max-n-extra { panic("Strs: size overflow") }
+        n += len(str)+extra
+    }
+    data := C.malloc(C.size_t(n))
+    if data == nil { panic("Strs: allocation failed") }
+    table := unsafe.Slice((**uint8)(data), len(strs))
+    content := unsafe.Slice((*byte)(data), n)
+    offset := len(strs)*width
+    for i, str := range strs {
+        table[i] = &content[offset]
+        offset += copy(content[offset:], str)
+        if !strings.HasSuffix(str, "\x00") {
+            content[offset] = 0
+            offset++
+        }
+    }
+    return (**uint8)(data), func() { C.free(data) }
+}
 
-	// Allocate a contiguous array large enough to hold all the strings' contents.
-	n := 0
-	for i := range strs {
-		n += len(strs[i])
-	}
-	if n == 0 {
-		n = 1 // avoid allocating zero bytes in case all strings are empty.
-	}
-	data := C.malloc(C.size_t(n))
-
-	// Copy all the strings into data.
-	dataSlice := (*[1 << 30]byte)(data)[:n]
-	css := make([]*uint8, len(strs)) // Populated with pointers to each string.
-	offset := 0
-	for i := range strs {
-		copy(dataSlice[offset:offset+len(strs[i])], strs[i][:]) // Copy strs[i] into proper data location.
-		css[i] = (*uint8)(unsafe.Pointer(&dataSlice[offset]))   // Set a pointer to it.
-		offset += len(strs[i])
-	}
-
-	return (**uint8)(&css[0]), func() { C.free(data) }
+// StrsWithLengths preserves the exact byte lengths, including embedded NULs.
+// Pass lengths to ShaderSource and call free after the native call returns.
+func StrsWithLengths(strs ...string) (cstrs **uint8, lengths []int32, free func()) {
+    lengths = make([]int32, len(strs))
+    for i, str := range strs {
+        if len(str) > 1<<31-1 { panic("StrsWithLengths: string exceeds int32") }
+        lengths[i] = int32(len(str))
+    }
+    cstrs, free = Strs(strs...)
+    return
 }

@@ -271,12 +271,14 @@ func parseSignature(signature xmlSignature) (name string, ctype Type, err error)
 	}
 
 	// If the XML did not call out the name then parse it out
+	if strings.Contains(ctype.CDefinition, "struct "+ctype.Name) && ctype.Name != "" && !strings.HasPrefix(ctype.Name, "struct ") {
+		ctype.Name = "struct " + ctype.Name
+	}
 	if ctype.Name == "" {
 		cTypeName := ctype.CDefinition
 		cTypeName = strings.Replace(cTypeName, "const", "", -1)
 		cTypeName = strings.Replace(cTypeName, "*", "", -1)
-		cTypeName = strings.Replace(cTypeName, " ", "", -1)
-		ctype.Name = cTypeName
+		ctype.Name = strings.Join(strings.Fields(cTypeName), " ")
 	}
 
 	// Convert statically sized arrays to pointers
@@ -296,11 +298,20 @@ func parseEnums(enumSets []xmlEnumSet) (specEnums, error) {
 	enums := make(specEnums)
 	for _, set := range enumSets {
 		for _, enum := range set.Enums {
+			value := enum.Value
+			// EGL casts describe opaque native handles, represented as integer
+			// words in Go. Constant zero and signed timestamp sentinels need
+			// no C macro in the generated Go constant expression.
+			if strings.HasPrefix(value, "EGL_CAST(") && strings.HasSuffix(value, ")") {
+				if comma := strings.LastIndex(value, ","); comma >= 0 {
+					value = strings.TrimSpace(value[comma+1 : len(value)-1])
+				}
+			}
 			enumRef := specRef{enum.Name, enum.API}
 			enums[enumRef] = &Enum{
 				Name:   enum.Name,
 				GoName: TrimAPIPrefix(enum.Name),
-				Value:  enum.Value}
+				Value:  value}
 		}
 	}
 	return enums, nil
@@ -470,6 +481,13 @@ func (typedefs specTypedefs) selectRequired(name, api string, requiredTypedefs [
 	specTypedef, ok := typedefs[specRef{name, api}]
 	if !ok {
 		specTypedef = typedefs[specRef{name, ""}]
+	}
+	if specTypedef == nil && strings.HasPrefix(name, "struct ") {
+		name = strings.TrimPrefix(name, "struct ")
+		specTypedef = typedefs[specRef{name, api}]
+		if specTypedef == nil {
+			specTypedef = typedefs[specRef{name, ""}]
+		}
 	}
 	if specTypedef != nil {
 		requiredTypedefs[specTypedef.ordinal] = specTypedef.typedef

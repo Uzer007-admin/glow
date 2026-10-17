@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,7 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
+
+	"golang.org/x/mod/modfile"
 )
 
 func generate(name string, args []string) {
@@ -28,6 +33,7 @@ func generate(name string, args []string) {
 		remext      = flags.String("remext", "", "If non-empty, a regular expression describing which extensions to exclude")
 		restrict    = flags.String("restrict", "", "JSON file of symbols to restrict symbol generation")
 		lenientInit = flags.Bool("lenientInit", false, "When true missing functions do not fail Init")
+		dispatch    = flags.Bool("dispatch", false, "Generate immutable per-context Functions tables in addition to the global API (profiles without debug callbacks)")
 	)
 	flags.Parse(args)
 
@@ -69,15 +75,21 @@ func generate(name string, args []string) {
 	for _, spec := range specs {
 		if spec.HasPackage(packageSpec) {
 			pkg = spec.ToPackage(packageSpec)
+			pkg.ContextDispatch = *dispatch
 			docs.AddDocs(pkg)
 			if len(*restrict) > 0 {
-				performRestriction(pkg, *restrict)
+				if err := performRestriction(pkg, *restrict); err != nil {
+					log.Fatalln("error applying symbol restriction:", err)
+				}
 			}
 			if err := pkg.GeneratePackage(*outDir); err != nil {
 				log.Fatalln("error generating package:", err)
 			}
 			if err := copyIncludes(filepath.Join(*xmlDir, "include"), *outDir); err != nil {
 				log.Fatalln("error copying includes:", err)
+			}
+			if err := writeHeaderImports(*outDir, pkg.Name); err != nil {
+				log.Fatalln("error writing vendor imports:", err)
 			}
 			break
 		}
@@ -93,7 +105,7 @@ func generate(name string, args []string) {
 //
 // In a module-only case, this function returns the current working directory.
 func determineGlowBaseDir() string {
-	glowBaseDir, err := importPathToDir("github.com/go-gl/glow")
+	glowBaseDir, err := importPathToDir("github.com/Uzer007-admin/glow")
 	if err != nil {
 		glowBaseDir, err = os.Getwd()
 	}
@@ -113,22 +125,74 @@ func lookupMap(s []string) map[string]bool {
 }
 
 type jsonRestriction struct {
-	Enums     []string
-	Functions []string
+	Enums     []string `json:"enums"`
+	Functions []string `json:"functions"`
 }
 
 // Reads the given JSON file path into jsonRestriction and filters the package
 // accordingly.
-func performRestriction(pkg *Package, jsonPath string) {
-	data, err := ioutil.ReadFile(jsonPath)
+func performRestriction(pkg *Package, jsonPath string) error {
+	data, err := os.ReadFile(jsonPath)
 	if err != nil {
-		log.Fatalln("error reading JSON restriction file:", err)
+		return fmt.Errorf("read %s: %w", jsonPath, err)
 	}
-	var r jsonRestriction
-	if err = json.Unmarshal(data, &r); err != nil {
-		log.Fatalln("error parsing JSON restriction file:", err)
+	var r *jsonRestriction
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&r); err != nil {
+		return fmt.Errorf("parse %s: %w", jsonPath, err)
 	}
-	pkg.Filter(lookupMap(r.Enums), lookupMap(r.Functions))
+	if r == nil {
+		return fmt.Errorf("%s: expected a restriction object", jsonPath)
+	}
+	var trailing any
+	if err = decoder.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("%s: unexpected content after restriction object", jsonPath)
+	}
+	// Validate before mutating the package so an invalid restriction cannot
+	// silently create incomplete bindings. Sort diagnostics for reproducibility.
+	var invalid []string
+	seen := make(map[string]bool)
+	for _, name := range r.Enums {
+		if pkg.Enums[name] == nil {
+			invalid = append(invalid, "unknown enum "+name)
+		} else if seen[name] {
+			invalid = append(invalid, "duplicate enum "+name)
+		}
+		seen[name] = true
+	}
+	clear(seen)
+	for _, name := range r.Functions {
+		if pkg.Functions[name] == nil {
+			invalid = append(invalid, "unknown function "+name)
+		} else if seen[name] {
+			invalid = append(invalid, "duplicate function "+name)
+		}
+		seen[name] = true
+	}
+	if len(invalid) > 0 {
+		sort.Strings(invalid)
+		return fmt.Errorf("%s: %s", jsonPath, strings.Join(invalid, "; "))
+	}
+	// An omitted list keeps that category; an explicitly empty list removes it.
+	// Keep Package.Filter's historical zero-length map behavior for its callers.
+	if r.Enums != nil {
+		keep := lookupMap(r.Enums)
+		for name := range pkg.Enums {
+			if !keep[name] {
+				delete(pkg.Enums, name)
+			}
+		}
+	}
+	if r.Functions != nil {
+		keep := lookupMap(r.Functions)
+		for name := range pkg.Functions {
+			if !keep[name] {
+				delete(pkg.Functions, name)
+			}
+		}
+	}
+	return nil
 }
 
 func parseSpecifications(xmlDir string) []*Specification {
@@ -200,6 +264,11 @@ func copyIncludes(srcDir, dstDir string) error {
 			if err != nil {
 				return err
 			}
+			// Every include directory must survive a fresh go mod vendor.
+			stub := "//go:build required\n\n// Package dummy preserves native headers in vendored modules.\npackage dummy\n"
+			if err := writeFileIfChanged(filepath.Join(dstName, "dummy.go"), []byte(stub), 0644); err != nil {
+				return err
+			}
 		case file.Size() > 0:
 			err := copyFile(srcName, dstName)
 			if err != nil {
@@ -211,20 +280,67 @@ func copyIncludes(srcDir, dstDir string) error {
 }
 
 func copyFile(srcFile, dstFile string) error {
-	out, err := os.Create(dstFile)
+	data, err := os.ReadFile(srcFile)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	return writeFileIfChanged(dstFile, data, 0644)
+}
 
-	in, err := os.Open(srcFile)
+// writeHeaderImports keeps generated header subdirectories in fresh vendored
+// consumers. SDK directories cannot be discovered from C preprocessor text.
+func writeHeaderImports(directory, packageName string) error {
+	directory, err := filepath.Abs(directory)
 	if err != nil {
 		return err
 	}
-	defer in.Close()
-
-	_, err = io.Copy(out, in)
-	return err
+	moduleRoot := directory
+	var modulePath string
+	for {
+		data, err := os.ReadFile(filepath.Join(moduleRoot, "go.mod"))
+		if err == nil {
+			modulePath = modfile.ModulePath(data)
+			break
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		parent := filepath.Dir(moduleRoot)
+		if parent == moduleRoot {
+			return nil
+		} // Standalone output without a module.
+		moduleRoot = parent
+	}
+	if modulePath == "" {
+		return fmt.Errorf("missing module path in %s", moduleRoot)
+	}
+	relative, err := filepath.Rel(moduleRoot, directory)
+	if err != nil {
+		return err
+	}
+	importPath := modulePath
+	if relative != "." {
+		importPath += "/" + filepath.ToSlash(relative)
+	}
+	var imports []string
+	err = filepath.WalkDir(directory, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && entry.Name() == "dummy.go" && filepath.Dir(path) != directory {
+			rel, err := filepath.Rel(directory, filepath.Dir(path))
+			if err != nil {
+				return err
+			}
+			imports = append(imports, "\t_ "+strconv.Quote(importPath+"/"+filepath.ToSlash(rel)))
+		}
+		return nil
+	})
+	if err != nil || len(imports) == 0 {
+		return err
+	}
+	text := "//go:build required\n\n// Code generated by glow. DO NOT EDIT.\npackage " + packageName + "\n\nimport (\n" + strings.Join(imports, "\n") + "\n)\n"
+	return writeFileIfChanged(filepath.Join(directory, "build_cgo_hack.go"), []byte(text), 0644)
 }
 
 // PackageSpec describes a package to be generated.

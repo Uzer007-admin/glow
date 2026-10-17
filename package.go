@@ -19,6 +19,8 @@ type Package struct {
 	Version Version
 	Profile string
 	TmplDir string
+	// ContextDispatch adds immutable procedure tables alongside the global API.
+	ContextDispatch bool
 
 	Typedefs  []*Typedef
 	Enums     map[string]*Enum
@@ -30,6 +32,29 @@ type PackageFunction struct {
 	Function
 	Required bool
 	Doc      string
+}
+
+// DispatchReceiver avoids collisions with registry parameter names (for
+// example glDepthRangef's parameter f). Overloads choose their own receiver.
+func (f Function) DispatchReceiver() string {
+	name := "glowContext"
+	for {
+		found := false
+		for _, p := range f.Parameters {
+			if p.GoName() == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return name
+		}
+		name += "_"
+	}
+}
+
+func (o Overload) DispatchReceiver() string {
+	return (Function{Parameters: o.Parameters}).DispatchReceiver()
 }
 
 // Comment returns the comment explaining the function.
@@ -62,31 +87,40 @@ func (pkg *Package) UniqueName() string {
 
 // GeneratePackage writes a Go package to specified directory.
 func (pkg *Package) GeneratePackage(dir string) error {
+	if pkg.ContextDispatch && pkg.HasDebugCallbackFeature() {
+		return errors.New("context dispatch does not support callbacks with global user data; restrict the profile before enabling dispatch")
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-
-	if err := pkg.generateFile("package", dir); err != nil {
+	staging, err := os.MkdirTemp(dir, ".glow-generation-")
+	if err != nil {
 		return err
 	}
-	if err := pkg.generateFile("conversions", dir); err != nil {
-		return err
-	}
-	if err := pkg.generateFile("procaddr", dir); err != nil {
-		return err
-	}
-	if pkg.HasDebugCallbackFeature() {
-		if err := pkg.generateFile("debug", dir); err != nil {
+	// Staging is created inside the requested output directory; cleanup cannot
+	// traverse an unrelated checkout or remove user source files.
+	defer os.RemoveAll(staging)
+	files := []string{"package.go", "conversions.go", "procaddr.go", "symbol_manifest.json"}
+	for _, template := range []string{"package", "conversions", "procaddr"} {
+		if err := pkg.generateFile(template, staging); err != nil {
 			return err
 		}
 	}
-
-	// gofmt the generated .go files.
-	if err := exec.Command("gofmt", "-w", dir).Run(); err != nil {
-		return fmt.Errorf("gofmt error: %v", err)
+	if pkg.HasDebugCallbackFeature() {
+		if err := pkg.generateFile("debug", staging); err != nil {
+			return err
+		}
+		files = append(files, "debug.go")
+	}
+	if err := pkg.writeManifest(staging); err != nil {
+		return err
 	}
 
-	return nil
+	// gofmt the generated .go files.
+	if output, err := exec.Command("gofmt", "-w", staging).CombinedOutput(); err != nil {
+		return fmt.Errorf("gofmt %s: %w\n%s", dir, err, output)
+	}
+	return publishGenerated(dir, staging, files, !pkg.HasDebugCallbackFeature())
 }
 
 func (pkg *Package) generateFile(file, dir string) error {
@@ -94,16 +128,27 @@ func (pkg *Package) generateFile(file, dir string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
 	fns := template.FuncMap{
 		"replace": strings.Replace,
 		"toUpper": strings.ToUpper,
 	}
 
-	tmpl := template.Must(template.New(file + ".tmpl").Funcs(fns).ParseFiles(filepath.Join(pkg.TmplDir, file+".tmpl")))
-
-	return tmpl.Execute(NewBlankLineStrippingWriter(out), pkg)
+	tmpl, err := template.New(file + ".tmpl").Funcs(fns).ParseFiles(filepath.Join(pkg.TmplDir, file+".tmpl"))
+	if err != nil {
+		out.Close()
+		return fmt.Errorf("parse %s template: %w", file, err)
+	}
+	writer := NewBlankLineStrippingWriter(out)
+	err = tmpl.Execute(writer, pkg)
+	if err == nil {
+		err = writer.Flush()
+	}
+	closeErr := out.Close()
+	if err != nil {
+		return fmt.Errorf("execute %s template: %w", file, err)
+	}
+	return closeErr
 }
 
 // HasDebugCallbackFeature returns whether this package exposes the ability to
@@ -162,6 +207,12 @@ func importPathToDir(importPath string) (string, error) {
 	pkgs, err := packages.Load(nil, importPath)
 	if err != nil {
 		return "", err
+	}
+	if len(pkgs) != 1 {
+		return "", fmt.Errorf("expected one package for %q, got %d", importPath, len(pkgs))
+	}
+	if len(pkgs[0].Errors) > 0 {
+		return "", fmt.Errorf("load %q: %v", importPath, pkgs[0].Errors)
 	}
 	if len(pkgs[0].GoFiles) == 0 {
 		return "", errors.New("no Go file available")

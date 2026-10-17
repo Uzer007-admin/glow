@@ -24,6 +24,10 @@ package {{.Name}}
 {{define "paramsGoDecl"}}{{range $i, $p := .}}{{if ne $i 0}}, {{end}}{{$p.GoName}} {{$p.Type.GoType}}{{end}}{{end}}
 {{define "paramsGoCall"}}{{range $i, $p := .}}{{if ne $i 0}}, {{end}}{{$p.Type.ConvertGoToC $p.GoName}}{{end}}{{end}}
 
+{{if eq .API "egl"}}
+// #cgo linux freebsd netbsd openbsd pkg-config: egl
+// #cgo windows darwin LDFLAGS: -lEGL
+{{else}}
 // #cgo !gles2,darwin        LDFLAGS: -framework OpenGL
 // #cgo gles2,darwin         LDFLAGS: -framework OpenGLES
 // #cgo !gles2,windows       LDFLAGS: -lopengl32
@@ -31,6 +35,8 @@ package {{.Name}}
 //
 // #cgo !egl,linux !egl,freebsd !egl,netbsd !egl,openbsd pkg-config: gl
 // #cgo egl,linux egl,freebsd egl,netbsd egl,openbsd    pkg-config: egl
+{{end}}
+// #include <stdint.h>
 //
 // #if defined(_WIN32) && !defined(APIENTRY) && !defined(__CYGWIN__) && !defined(__SCITECH_SNAP__)
 // #ifndef WIN32_LEAN_AND_MEAN
@@ -75,9 +81,34 @@ package {{.Name}}
 // {{end}}
 // {{end}}
 //
+// {{if and .ContextDispatch (index .Functions "glShaderSource")}}
+// static void glowShaderSourceString(GPSHADERSOURCE fnptr, GLuint shader, const char* source, GLint length) {
+//   const GLchar* text = source ? (const GLchar*) source : (const GLchar*) "";
+//   (*fnptr)(shader, 1, &text, &length);
+// }
+// {{end}}
+// {{if and .ContextDispatch (index .Functions "glGetIntegerv")}}
+// typedef struct { GLint draw, read, viewport[4]; } GlowFramebufferViewport;
+// static GlowFramebufferViewport glowFramebufferViewport(GPGETINTEGERV fnptr, int split) {
+//   GlowFramebufferViewport result = {0};
+//   (*fnptr)(0x8CA6, &result.draw);
+//   if (split) (*fnptr)(0x8CAA, &result.read); else result.read = result.draw;
+//   (*fnptr)(0x0BA2, result.viewport);
+//   return result;
+// }
+// typedef struct { GLint texture, draw, read, unpack; } GlowTargetBindings;
+// static GlowTargetBindings glowTargetBindings(GPGETINTEGERV fnptr, int split, int unpack) {
+//   GlowTargetBindings result = {0};
+//   (*fnptr)(0x8069, &result.texture);
+//   (*fnptr)(0x8CA6, &result.draw);
+//   if (split) (*fnptr)(0x8CAA, &result.read); else result.read = result.draw;
+//   if (unpack) (*fnptr)(0x88EF, &result.unpack);
+//   return result;
+// }
+// {{end}}
 import "C"
 import (
-  {{if .HasRequiredFunctions}}
+  {{if or .HasRequiredFunctions .ContextDispatch}}
   "errors"
   {{end}}
   "unsafe"
@@ -152,20 +183,152 @@ func {{.OverloadName}}({{template "paramsGoDecl" .Parameters}}){{if not .Return.
 // Function Retrieval" section of https://www.opengl.org/wiki/Load_OpenGL_Functions.
 //glow:rmspace
 func Init() error {
-  return InitWithProcAddrFunc(getProcAddress)
+  return initWithProcAddrFunc(getProcAddress, true)
 }
 
-// InitWithProcAddrFunc intializes the package using the specified OpenGL
-// function pointer loading function. For more cases Init should be used
+// InitWithProcAddrFunc initializes the package using the specified OpenGL
+// function pointer loading function. For most cases Init should be used
 // instead.
 func InitWithProcAddrFunc(getProcAddr func(name string) unsafe.Pointer) error {
+  return initWithProcAddrFunc(getProcAddr, false)
+}
+
+func initWithProcAddrFunc(getProcAddr func(name string) unsafe.Pointer, terminated bool) error {
+  {{if .HasRequiredFunctions}}var firstMissing string{{end}}
   {{range .Functions}}
-  gp{{.GoName}} = (C.GP{{toUpper .GoName}})(getProcAddr("{{.Name}}"))
+  {
+  name := "{{.Name}}"
+  if terminated { name = "{{.Name}}\x00" }
+  gp{{.GoName}} = (C.GP{{toUpper .GoName}})(getProcAddr(name))
   {{if .Required}}
-  if gp{{.GoName}} == nil {
-    return errors.New("{{.Name}}")
+  if gp{{.GoName}} == nil && firstMissing == "" {
+    firstMissing = "{{.Name}}"
   }
   {{end}}
+  }
+  {{end}}
+  {{if .HasRequiredFunctions}}
+  if firstMissing != "" { return errors.New(firstMissing) }
   {{end}}
 	return nil
 }
+
+// IsFunctionAvailable reports whether Init loaded the named procedure in this
+// binding package. Use the original C name, for example "glBindFramebuffer".
+// A non-nil address does not prove context version or extension support.
+// Call on the context's owner thread after a successful Init. As with the
+// bindings themselves, this state is replaced when Init is called again.
+func IsFunctionAvailable(name string) bool {
+  switch name {
+  {{range .Functions}}
+  case "{{.Name}}": return gp{{.GoName}} != nil
+  {{end}}
+  default: return false
+  }
+}
+
+{{define "dispatchCall"}}C.glow{{.GoName}}({{.DispatchReceiver}}.gp{{.GoName}}{{if ge (len .Parameters) 1}}, {{end}}{{template "paramsGoCall" .Parameters}}){{end}}
+{{define "dispatchOverloadCall"}}C.glow{{.OverloadName}}({{.DispatchReceiver}}.gp{{.GoName}}{{if ge (len .Parameters) 1}}, {{end}}{{template "paramsGoCall" .Parameters}}){{end}}
+{{if .ContextDispatch}}
+// Functions owns procedure addresses loaded for one context generation. Its
+// fields are private and never changed after loading. Switching a different
+// window's table does not modify this table or the package-level bindings.
+// Calls still require the matching live context on its owner thread. Destroyed
+// or recreated contexts invalidate their tables; a table does not own a context.
+// Concurrent calls are subject to the GL context's thread rules.
+type Functions struct {
+  {{range .Functions}}
+  gp{{.GoName}} C.GP{{toUpper .GoName}}
+  {{end}}
+}
+
+{{if index .Functions "glGetIntegerv"}}
+// GetFramebufferViewport queries fixed-size framebuffer/viewport state in one
+// cgo transition using C stack storage. split must only be true on a context
+// supporting separate read/draw framebuffer bindings. It does not pump events.
+func (f *Functions) GetFramebufferViewport(split bool) (draw, read int32, viewport [4]int32) {
+  state := C.glowFramebufferViewport(f.gpGetIntegerv, C.int(boolToInt(split)))
+  return int32(state.draw), int32(state.read), [4]int32{int32(state.viewport[0]), int32(state.viewport[1]), int32(state.viewport[2]), int32(state.viewport[3])}
+}
+
+// GetTargetBindings queries texture, framebuffer and optional pixel-unpack
+// buffer bindings in one cgo transition. split/unpack require the corresponding
+// context API/extension support; skipped unpack returns zero. The texture is
+// the binding on the caller's active texture unit, which this query preserves.
+func (f *Functions) GetTargetBindings(split, unpack bool) (texture, draw, read, pixelUnpack int32) {
+  state := C.glowTargetBindings(f.gpGetIntegerv, C.int(boolToInt(split)), C.int(boolToInt(unpack)))
+  return int32(state.texture), int32(state.draw), int32(state.read), int32(state.unpack)
+}
+{{end}}
+
+{{if index .Functions "glShaderSource"}}
+// ShaderSourceString uploads one length-delimited source without a C allocation
+// or a Go pointer-to-pointer. It accepts empty sources and requires no final NUL.
+// GL copies the source before returning; embedded NULs retain their GL meaning.
+func (f *Functions) ShaderSourceString(shader uint32, source string) error {
+  if uint64(len(source)) > 0x7fffffff { return errors.New("gl: shader source exceeds GLsizei") }
+  C.glowShaderSourceString(f.gpShaderSource, C.GLuint(shader), (*C.char)(unsafe.Pointer(unsafe.StringData(source))), C.GLint(len(source)))
+  return nil
+}
+{{end}}
+
+// Load resolves a new table from the current context without changing globals.
+func Load() (*Functions, error) { return loadFunctions(getProcAddress, true) }
+
+// LoadWithProcAddrFunc resolves plain C names using a caller-supplied resolver.
+// On missing required procedures no usable table is returned. Optional
+// procedures must be checked together with context version/extension support.
+func LoadWithProcAddrFunc(resolve func(string) unsafe.Pointer) (*Functions, error) {
+  if resolve == nil { return nil, errors.New("gl: nil procedure resolver") }
+  return loadFunctions(resolve, false)
+}
+
+func loadFunctions(resolve func(string) unsafe.Pointer, terminated bool) (*Functions, error) {
+  f := new(Functions)
+  {{if .HasRequiredFunctions}}var firstMissing string{{end}}
+  {{range .Functions}}
+  {
+    name := "{{.Name}}"
+    if terminated { name = "{{.Name}}\x00" }
+    f.gp{{.GoName}} = (C.GP{{toUpper .GoName}})(resolve(name))
+    {{if .Required}}
+    if f.gp{{.GoName}} == nil && firstMissing == "" { firstMissing = "{{.Name}}" }
+    {{end}}
+  }
+  {{end}}
+  {{if .HasRequiredFunctions}}
+  if firstMissing != "" { return nil, errors.New(firstMissing) }
+  {{end}}
+  return f, nil
+}
+
+func (f *Functions) IsFunctionAvailable(name string) bool {
+  if f == nil { return false }
+  switch name {
+  {{range .Functions}}
+  case "{{.Name}}": return f.gp{{.GoName}} != nil
+  {{end}}
+  default: return false
+  }
+}
+
+{{range .Functions}}
+{{.Comment}}
+func ({{.DispatchReceiver}} *Functions) {{.GoName}}({{template "paramsGoDecl" .Parameters}}){{if not .Return.IsVoid}} {{.Return.GoType}}{{end}} {
+  {{if .Return.IsVoid}}{{template "dispatchCall" .}}
+  {{else}}
+  ret := {{template "dispatchCall" .}}
+  return {{.Return.ConvertCToGo "ret"}}
+  {{end}}
+}
+{{range .Overloads}}
+func ({{.DispatchReceiver}} *Functions) {{.OverloadName}}({{template "paramsGoDecl" .Parameters}}){{if not .Return.IsVoid}} {{.Return.GoType}}{{end}} {
+  {{if .Return.IsVoid}}{{template "dispatchOverloadCall" .}}
+  {{else}}
+  ret := {{template "dispatchOverloadCall" .}}
+  return {{.Return.ConvertCToGo "ret"}}
+  {{end}}
+}
+{{end}}
+{{end}}
+{{end}}

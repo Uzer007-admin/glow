@@ -49,6 +49,20 @@ func (t Type) GoCType() string {
 // GoType returns the Go definition of the type.
 func (t Type) GoType() string {
 	switch t.Name {
+	case "EGLBoolean", "EGLenum":
+		return t.pointers() + "uint32"
+	case "EGLint", "EGLNativeFileDescriptorKHR", "Bool":
+		return t.pointers() + "int32"
+	case "EGLAttrib", "EGLAttribKHR", "EGLsizeiANDROID":
+		return t.pointers() + "int"
+	case "EGLTime", "EGLTimeKHR", "EGLTimeNV", "EGLuint64KHR", "EGLuint64NV":
+		return t.pointers() + "uint64"
+	case "EGLnsecsANDROID":
+		return t.pointers() + "int64"
+	case "char":
+		return t.pointers() + "uint8"
+	case "EGLDisplay", "EGLConfig", "EGLContext", "EGLSurface", "EGLClientBuffer", "EGLImage", "EGLImageKHR", "EGLSync", "EGLSyncKHR", "EGLSyncNV", "EGLDeviceEXT", "EGLStreamKHR", "EGLLabelKHR", "EGLObjectKHR", "EGLOutputLayerEXT", "EGLOutputPortEXT", "EGLNativeDisplayType", "EGLNativeWindowType", "EGLNativePixmapType", "NativeDisplayType", "NativeWindowType", "NativePixmapType":
+		return t.pointers() + "uintptr"
 	case "GLbyte":
 		return t.pointers() + "int8"
 	case "GLubyte":
@@ -142,6 +156,9 @@ func (t Type) ConvertCToGo(name string) string {
 	if t.Name == "GLboolean" {
 		return fmt.Sprintf("%s == TRUE", name)
 	}
+	if t.PointerLevel > 0 && t.GoType() != "unsafe.Pointer" {
+		return fmt.Sprintf("(%s)(unsafe.Pointer(%s))", t.GoType(), name)
+	}
 	return fmt.Sprintf("(%s)(%s)", t.GoType(), name)
 }
 
@@ -151,6 +168,12 @@ func (t Type) pointers() string {
 
 // CTypedef returns the C definition of the typedef.
 func (t Typedef) CTypedef() string {
+	if t.Name == "eglplatform" {
+		return "#define EGLNativeDisplayType glowNativeDisplayType\n#define EGLNativeWindowType glowNativeWindowType\n#define EGLNativePixmapType glowNativePixmapType\n#define NativeDisplayType glowOldDisplayType\n#define NativeWindowType glowOldWindowType\n#define NativePixmapType glowOldPixmapType\n#include <EGL/eglplatform.h>\n#undef EGLNativeDisplayType\n#undef EGLNativeWindowType\n#undef EGLNativePixmapType\n#undef NativeDisplayType\n#undef NativeWindowType\n#undef NativePixmapType\ntypedef uintptr_t EGLNativeDisplayType;\ntypedef uintptr_t EGLNativeWindowType;\ntypedef uintptr_t EGLNativePixmapType;\ntypedef uintptr_t NativeDisplayType;\ntypedef uintptr_t NativeWindowType;\ntypedef uintptr_t NativePixmapType;"
+	}
+	if strings.HasPrefix(t.Name, "EGL") && strings.Contains(t.CDefinition, "typedef void *") {
+		return "typedef uintptr_t " + t.Name + ";"
+	}
 	// GLsync is defined as an opaque struct pointer, but some OpenGL drivers
 	// store a non-pointer numeric handle in the type, which is incompatible with
 	// Go pointer semantics. As a workaround we redefined GLsync to be an opaque

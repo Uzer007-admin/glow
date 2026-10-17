@@ -1,4 +1,10 @@
 <overloads>
+    <overload name="glDrawElementsInstanced" overloadName="DrawElementsInstancedWithOffset">
+        <parameterChanges><change index="3"><name value="offset" /><type signature="uintptr_t" /></change></parameterChanges>
+    </overload>
+    <overload name="glReadPixels" overloadName="ReadPixelsWithOffset">
+        <parameterChanges><change index="6"><name value="offset" /><type signature="uintptr_t" /></change></parameterChanges>
+    </overload>
     <overload name="glDrawElements" overloadName="DrawElementsWithOffset">
         <parameterChanges>
             <change index="3">
